@@ -1,0 +1,91 @@
+# Local sandbox for the cost-optimization agent.
+#
+#   cadvisor    -> per-container CPU/memory metrics
+#   prometheus  -> scrapes cadvisor, serves the HTTP query API the agent reads
+#   3 workloads -> deliberately over-provisioned, with distinct load shapes
+#
+# The workloads carry cost-opt.* labels; the agent only ever proposes changes
+# to containers labelled cost-opt.managed=true, so it can never touch its own
+# observability stack.
+
+name: cost-opt-agent
+
+services:
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: cadvisor
+    privileged: true
+    ports:
+      - "8080:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    # Deliberately NOT mounting /var/run/docker.sock, and deliberately not
+    # passing --docker_only. cAdvisor's Docker handler expects the classic
+    # image/overlayfs/layerdb storage layout, which Docker Desktop 29.x does
+    # not use -- with the socket mounted it claims every container and then
+    # fails to read the read-write layer, emitting nothing. Without it, the raw
+    # cgroup factory reports the same containers keyed by cgroup id, which
+    # agent/metrics.py resolves back to container names via the Docker API.
+    command:
+      - --housekeeping_interval=5s
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+    depends_on:
+      - cadvisor
+    restart: unless-stopped
+
+  # Steady request-serving tier. Uses ~8% of a core and ~30 MB, but was given
+  # 1.5 cores and 1 GB.
+  web-frontend:
+    image: python:3.12-alpine
+    container_name: web-frontend
+    command: ["python", "-u", "/app/steady.py"]
+    volumes:
+      - ../workloads/steady.py:/app/steady.py:ro
+    mem_limit: 1g
+    cpus: 1.5
+    labels:
+      cost-opt.managed: "true"
+      cost-opt.tier: "frontend"
+    restart: unless-stopped
+
+  # Bursty payment path. Low average utilisation hides multi-hundred-MB spikes
+  # and an intermittent crash loop.
+  payment-service:
+    image: python:3.12-alpine
+    container_name: payment-service
+    command: ["python", "-u", "/app/spiky.py"]
+    volumes:
+      - ../workloads/spiky.py:/app/spiky.py:ro
+    mem_limit: 1g
+    cpus: 2.0
+    labels:
+      cost-opt.managed: "true"
+      cost-opt.tier: "payments"
+    restart: unless-stopped
+
+  # Idle between nightly batch runs.
+  batch-worker:
+    image: python:3.12-alpine
+    container_name: batch-worker
+    command: ["python", "-u", "/app/idle.py"]
+    volumes:
+      - ../workloads/idle.py:/app/idle.py:ro
+    mem_limit: 2g
+    cpus: 1.0
+    labels:
+      cost-opt.managed: "true"
+      cost-opt.tier: "batch"
+    restart: unless-stopped
