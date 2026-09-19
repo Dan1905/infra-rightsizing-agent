@@ -24,6 +24,7 @@ from kubernetes.utils import parse_quantity
 from ..config import Settings
 from .base import (
     MIN_REPLICAS,
+    MIN_WINDOW_LABEL,
     ExecutionResult,
     GuardrailError,
     WorkloadMetrics,
@@ -31,6 +32,7 @@ from .base import (
     check_cpu_request,
     check_memory,
     check_memory_request,
+    check_window,
 )
 from .prometheus import instant_query
 
@@ -190,6 +192,7 @@ class KubernetesBackend:
                     hpa_managed=name in hpa_targets,
                     last_termination_reason=last_reason,
                     window=self.settings.lookback,
+                    min_window=labels.get(MIN_WINDOW_LABEL),
                 )
             )
 
@@ -234,13 +237,17 @@ class KubernetesBackend:
             ) from exc
         self.apps.patch_namespaced_deployment(name, self.namespace, body)
 
-    def _resources_patch(
-        self, dep, kind: str, params: dict[str, Any], metrics: WorkloadMetrics | None
-    ) -> tuple[dict[str, Any], str]:
-        container = dep.spec.template.spec.containers[0]
-        current = container.resources
-        requests = dict((current.requests or {}) if current else {})
-        limits = dict((current.limits or {}) if current else {})
+    @staticmethod
+    def _new_resources(
+        kind: str,
+        params: dict[str, Any],
+        metrics: WorkloadMetrics | None,
+        requests: dict[str, str],
+        limits: dict[str, str],
+    ) -> tuple[dict[str, str], list[str]]:
+        """Apply `params` to the requests or limits and run every resource
+        guardrail. Returns the new values for `kind` and a change summary."""
+        requests, limits = dict(requests), dict(limits)
         target = requests if kind == "requests" else limits
 
         changes = []
@@ -268,13 +275,54 @@ class KubernetesBackend:
                         f"{res} request {requests[res]} would exceed the {res} "
                         f"limit {limits[res]}"
                     )
+        return target, changes
 
-        body = {
-            "spec": {"template": {"spec": {"containers": [
-                {"name": container.name, "resources": {kind: target}}
-            ]}}}
-        }
-        return body, f"{kind}: " + ", ".join(changes)
+    def _check_scale(self, target: str, replicas: int, metrics: WorkloadMetrics | None) -> None:
+        if replicas < MIN_REPLICAS:
+            raise GuardrailError(
+                f"{replicas} replicas is below the floor of {MIN_REPLICAS}; "
+                "scaling to zero is stopping the service"
+            )
+        if metrics and metrics.hpa_managed:
+            raise GuardrailError(
+                f"a HorizontalPodAutoscaler manages `{target}`; changing "
+                "replicas by hand would fight it -- change the HPA instead"
+            )
+
+    @staticmethod
+    def _observed_resources(metrics: WorkloadMetrics) -> tuple[dict[str, str], dict[str, str]]:
+        """Requests and limits as quantity strings, from a metrics snapshot."""
+        def q(mem: float | None, cpu: float | None) -> dict[str, str]:
+            out = {}
+            if mem is not None:
+                out["memory"] = str(int(mem))
+            if cpu is not None:
+                out["cpu"] = _cpu_quantity(cpu)
+            return out
+        return (
+            q(metrics.mem_request_bytes, metrics.cpu_request_cores),
+            q(metrics.mem_limit_bytes, metrics.cpu_limit_cores),
+        )
+
+    def preflight(
+        self,
+        *,
+        target: str,
+        action: str,
+        params: dict[str, Any],
+        metrics: WorkloadMetrics | None,
+    ) -> str | None:
+        try:
+            check_window(metrics)
+            if action in ("set_requests", "set_limits") and metrics is not None:
+                requests, limits = self._observed_resources(metrics)
+                kind = "requests" if action == "set_requests" else "limits"
+                self._new_resources(kind, params, metrics, requests, limits)
+            elif action == "scale_replicas":
+                self._check_scale(target, int(params["replicas"]), metrics)
+        except GuardrailError as exc:
+            return str(exc)
+        return None
 
     def apply(
         self,
@@ -291,25 +339,29 @@ class KubernetesBackend:
                 )
 
             dep = self._require_managed(target)
+            check_window(metrics)
 
             if action in ("set_requests", "set_limits"):
                 kind = "requests" if action == "set_requests" else "limits"
-                body, detail = self._resources_patch(dep, kind, params, metrics)
-                self._patch(target, body)
-                return ExecutionResult(ok=True, detail=f"{detail} (rolling out new pods)")
+                container = dep.spec.template.spec.containers[0]
+                current = container.resources
+                target_values, changes = self._new_resources(
+                    kind,
+                    params,
+                    metrics,
+                    (current.requests or {}) if current else {},
+                    (current.limits or {}) if current else {},
+                )
+                self._patch(target, {"spec": {"template": {"spec": {"containers": [
+                    {"name": container.name, "resources": {kind: target_values}}
+                ]}}}})
+                return ExecutionResult(
+                    ok=True, detail=f"{kind}: {', '.join(changes)} (rolling out new pods)"
+                )
 
             if action == "scale_replicas":
                 replicas = int(params["replicas"])
-                if replicas < MIN_REPLICAS:
-                    raise GuardrailError(
-                        f"{replicas} replicas is below the floor of {MIN_REPLICAS}; "
-                        "scaling to zero is stopping the service"
-                    )
-                if metrics and metrics.hpa_managed:
-                    raise GuardrailError(
-                        f"a HorizontalPodAutoscaler manages `{target}`; changing "
-                        "replicas by hand would fight it -- change the HPA instead"
-                    )
+                self._check_scale(target, replicas, metrics)
                 before = dep.spec.replicas
                 self._patch(target, {"spec": {"replicas": replicas}})
                 return ExecutionResult(ok=True, detail=f"replicas {before} -> {replicas}")

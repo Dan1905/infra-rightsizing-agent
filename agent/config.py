@@ -95,12 +95,16 @@ class Settings:
     base_url: str = field(default_factory=lambda: _env_str("LLM_BASE_URL", ""))
     api_key: str = field(default_factory=lambda: _env_str("LLM_API_KEY", ""))
 
-    max_tokens: int = field(default_factory=lambda: _env_int("MAX_TOKENS", 4096))
+    # 0 = the provider's default (see providers.PRESETS).
+    max_tokens: int = field(default_factory=lambda: _env_int("MAX_TOKENS", 0))
     temperature: float = field(default_factory=lambda: _env_float("TEMPERATURE", 0.2))
     max_retries: int = field(default_factory=lambda: _env_int("MAX_RETRIES", 4))
     max_turns: int = field(default_factory=lambda: _env_int("MAX_TURNS", 12))
     # Anthropic-only; ignored by the OpenAI-compatible providers.
     effort: str = field(default_factory=lambda: _env_str("EFFORT", "high"))
+    # Reasoning models on OpenAI-compatible endpoints (gpt-oss): low | medium |
+    # high. Empty = the provider's default (see providers.py).
+    reasoning_effort: str = field(default_factory=lambda: _env_str("REASONING_EFFORT", ""))
 
     # --- Audit --------------------------------------------------------------
     audit_db: Path = field(

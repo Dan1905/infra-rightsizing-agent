@@ -76,6 +76,12 @@ passages on every turn. If you hit a rate limit, lower `RAG_TOP_K`, shorten
 Retrieved passages are pooled and deduplicated across containers for the same
 reason.
 
+**On Groq's free tier** each request (prompt *plus* `max_tokens`) must fit in
+8K tokens, and there is a 200K daily cap. The defaults are tuned for that:
+`max_tokens` 3072, `reasoning_effort=low` for gpt-oss (its reasoning counts
+against the output budget and otherwise truncates tool calls), and the model's
+own reasoning is not echoed back into the conversation on later turns.
+
 **On smaller open-weight models**, expect the loop to lean on its validation more than a
 frontier model does. `propose_change` rejects proposals that target unmanaged
 containers, omit citations, cite documents that were never retrieved, or leave
@@ -178,6 +184,13 @@ A one-hour window makes all three look over-provisioned. Only one of them is.
   the model: a hard 128 MiB / 0.25 core floor, and a refusal to set any memory
   limit below 1.2× the observed peak. A retrieved document can make the agent
   more conservative, never less. This matters more, not less, on a small model.
+- Guardrails run twice: once when the model proposes (a "preflight" against the
+  observed state, so a blocked proposal goes back to the model to correct
+  before any human sees it) and again at execution against live state.
+- A workload can declare how much history a sizing decision needs with the
+  label `cost-opt.min-window` (e.g. `24h` for a nightly job). Any change on a
+  shorter observation window is refused, whatever the model concluded. This is
+  the March postmortem's lesson moved from a document into enforcement.
 - `stop_container` requires `--allow-stop` on top of the typed approval.
 - Every run stores its retrievals, proposals, citations, the human decision and
   the execution result.

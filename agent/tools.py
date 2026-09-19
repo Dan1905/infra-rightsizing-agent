@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from .audit import AuditLog
 from .backends.base import WorkloadMetrics
@@ -239,6 +239,7 @@ class ToolContext:
         metrics: list[WorkloadMetrics],
         seed_context: dict[str, list[Chunk]],
         backend_actions: tuple[str, ...],
+        preflight: Callable[..., str | None] | None = None,
         verbose: bool = True,
     ):
         self.store = store
@@ -247,6 +248,7 @@ class ToolContext:
         self.metrics = {m.name: m for m in metrics}
         self.targets = {m.name for m in metrics if m.managed}
         self.actions = available_actions(backend_actions)
+        self.preflight = preflight
         self.verbose = verbose
         self.proposals: list[Proposal] = []
         # Everything retrieved this run, per workload plus a shared pool from
@@ -295,9 +297,13 @@ class ToolContext:
 
         if not chunks:
             return "No matching passages found. Try a broader query.", False
+        def body(c: Chunk) -> str:
+            # Stored text starts with its own address line; the header has it.
+            return c.text.split("\n", 1)[1] if c.text.startswith("[") else c.text
+
         return (
             "\n\n".join(
-                f"[{c.citation}] (distance {c.distance:.3f})\n{c.text}" for c in chunks
+                f"[{c.citation}] (distance {c.distance:.3f})\n{body(c)}" for c in chunks
             ),
             False,
         )
@@ -351,6 +357,21 @@ class ToolContext:
                 problem = self._check_param(p, args[p])
                 if problem:
                     return f"{problem} for {action}."
+
+        # Run the backend's guardrails now, against the observed state, so a
+        # proposal that would be blocked at execution is corrected here rather
+        # than discovered by the human after they approve it.
+        if self.preflight is not None and action not in UNIVERSAL_ACTIONS:
+            params = {p: args[p] for p in spec.params if args.get(p) is not None}
+            blocked = self.preflight(
+                target=workload, action=action, params=params,
+                metrics=self.metrics.get(workload),
+            )
+            if blocked:
+                return (
+                    f"this change would be blocked by a guardrail at execution: "
+                    f"{blocked}. Propose a value that satisfies it, or a different action."
+                )
 
         citations = args.get("policy_cited") or []
         if not isinstance(citations, list) or not citations:

@@ -106,24 +106,46 @@ def constraint_query(m: WorkloadMetrics) -> str:
     return " ".join(parts)
 
 
+def platform_query(m: WorkloadMetrics) -> str | None:
+    """Third seed query, for platform-specific rules.
+
+    The two queries above are phrased around the workload, so they surface the
+    workload's own documents -- and never the generic platform policy that
+    says, for example, that on Kubernetes requests rather than limits are what
+    cost money. Only issued where a platform policy applies.
+    """
+    if m.kind != "Deployment":
+        return None
+    return (
+        "Kubernetes requests versus limits: which drives cost and node count, "
+        "sizing requests, when a request change is worthwhile, limits, replica "
+        "floors, horizontal pod autoscaler, tier 1 service restrictions."
+    )
+
+
 def build_seed_context(
     store: PolicyStore,
     audit: AuditLog,
     run_id: str,
     metrics: list[WorkloadMetrics],
 ) -> dict[str, list[Chunk]]:
-    """Two retrievals per managed workload -- one shaped by the metrics, one
-    hunting for binding constraints -- merged and deduplicated."""
+    """Two or three retrievals per managed workload -- shaped by its metrics,
+    by its binding constraints, and by its platform -- merged and deduplicated."""
     seeds: dict[str, list[Chunk]] = {}
     for m in metrics:
         if not m.managed:
             continue
         found: list[Chunk] = []
-        for origin, query in (
+        queries = [
             ("seed-metrics", seed_query(m)),
             ("seed-constraints", constraint_query(m)),
-        ):
-            chunks = store.search(query)
+        ]
+        if (pq := platform_query(m)) is not None:
+            queries.append(("seed-platform", pq))
+        for origin, query in queries:
+            # The platform query is identical for every workload and covers a
+            # whole policy document, so it is worth a wider net.
+            chunks = store.search(query, k=5 if origin == "seed-platform" else None)
             found.extend(chunks)
             audit.log_retrieval(
                 run_id, origin=origin, query=query, results=[c.to_dict() for c in chunks]
@@ -167,7 +189,10 @@ def build_user_message(
     for chunk in pooled:
         sections.append(f"--- {chunk.citation}  (retrieved for: "
                         f"{', '.join(retrieved_by[chunk.id])})")
-        sections.append(chunk.text)
+        # Chunks are stored with their address as a first line (it helps the
+        # embedding); the header above already carries it.
+        body = chunk.text.split("\n", 1)[1] if chunk.text.startswith("[") else chunk.text
+        sections.append(body)
         sections.append("")
 
     sections += [
@@ -194,6 +219,7 @@ def run_analysis(
     audit: AuditLog,
     run_id: str,
     backend_actions: tuple[str, ...],
+    preflight: Any = None,
     provider: Provider | None = None,
     verbose: bool = True,
 ) -> tuple[list[Proposal], str, list[dict[str, Any]]]:
@@ -208,6 +234,7 @@ def run_analysis(
         metrics=metrics,
         seed_context=seed_context,
         backend_actions=backend_actions,
+        preflight=preflight,
         verbose=verbose,
     )
 
@@ -217,6 +244,7 @@ def run_analysis(
     transcript: list[dict[str, Any]] = [{"role": "user", "content": user_text}]
     narrative = ""
 
+    nudges_left = 2
     for _ in range(settings.max_turns):
         response = provider.call(messages, system)
 
@@ -229,6 +257,25 @@ def run_analysis(
         if not response.tool_calls:
             if response.stop_reason in ("max_tokens", "length"):
                 print("  [warn] response hit the token limit; raise MAX_TOKENS")
+            # Smaller models sometimes end a turn -- occasionally with an empty
+            # message -- before deciding every workload. Point at what is
+            # missing rather than silently accepting a partial plan.
+            undecided = sorted(ctx.targets - {p.workload for p in ctx.proposals})
+            if undecided and nudges_left > 0:
+                nudges_left -= 1
+                if verbose:
+                    print(f"  [loop] no decision yet for {', '.join(undecided)}; asking again")
+                nudge = {
+                    "role": "user",
+                    "content": (
+                        "You have not recorded a decision for: "
+                        f"{', '.join(undecided)}. Call `propose_change` once for "
+                        "each of them now."
+                    ),
+                }
+                messages.append(nudge)
+                transcript.append(nudge)
+                continue
             break
 
         results: list[tuple[Any, str, bool]] = []

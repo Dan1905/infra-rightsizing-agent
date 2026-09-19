@@ -27,6 +27,25 @@ MIN_REQUEST_CPU_CORES = 0.05
 MIN_REPLICAS = 1
 
 
+# A workload can declare how much history a sizing decision about it needs --
+# e.g. "24h" for a job that only does real work once a night. Rightsizing it on
+# less is the failure mode from the 2026-03-14 postmortem, so it is enforced
+# here rather than left to the model reading the right document.
+MIN_WINDOW_LABEL = "cost-opt.min-window"
+
+_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def parse_duration(value: str) -> int:
+    """Seconds in a Prometheus-style duration such as 30m, 1h, 1h30m, 7d."""
+    import re
+
+    parts = re.findall(r"(\d+)([smhdw])", value.strip())
+    if not parts or "".join(n + u for n, u in parts) != value.strip():
+        raise ValueError(f"not a duration: {value!r}")
+    return sum(int(n) * _DURATION_UNITS[u] for n, u in parts)
+
+
 class MetricsError(RuntimeError):
     """The metrics source was unreachable or answered with an error."""
 
@@ -90,6 +109,8 @@ class WorkloadMetrics:
     last_termination_reason: str | None = None
 
     window: str = "1h"
+    # From the MIN_WINDOW_LABEL label, if the workload declares one.
+    min_window: str | None = None
 
     # -- derived ------------------------------------------------------------
 
@@ -156,6 +177,26 @@ def check_memory(memory_mib: int, metrics: WorkloadMetrics | None, *, what: str 
             )
 
 
+def check_window(metrics: WorkloadMetrics | None) -> None:
+    """Refuse any change to a workload observed for less than it declares it needs."""
+    if not metrics or not metrics.min_window:
+        return
+    try:
+        needed = parse_duration(metrics.min_window)
+    except ValueError:
+        raise GuardrailError(
+            f"`{metrics.name}` declares an unreadable {MIN_WINDOW_LABEL} "
+            f"({metrics.min_window!r}); refusing to change it until that is fixed"
+        )
+    if parse_duration(metrics.window) < needed:
+        raise GuardrailError(
+            f"`{metrics.name}` declares that sizing decisions need at least "
+            f"{metrics.min_window} of observation ({MIN_WINDOW_LABEL}); this run "
+            f"observed {metrics.window}. Leave it unchanged, or re-run with "
+            f"--lookback {metrics.min_window} once that much history exists"
+        )
+
+
 def check_cpu(cpu_cores: float) -> None:
     if cpu_cores < MIN_CPU_CORES:
         raise GuardrailError(
@@ -212,6 +253,23 @@ class Backend(Protocol):
         params: dict[str, Any],
         metrics: WorkloadMetrics | None,
     ) -> ExecutionResult: ...
+
+    def preflight(
+        self,
+        *,
+        target: str,
+        action: str,
+        params: dict[str, Any],
+        metrics: WorkloadMetrics | None,
+    ) -> str | None:
+        """Run the guardrails against the observed state without changing
+        anything. Returns why the change would be blocked, or None.
+
+        Called when the model proposes, so it can correct a proposal before a
+        human ever sees it. `apply` runs the same checks again against live
+        state, so this is an early warning, never the enforcement point.
+        """
+        ...
 
     def describe_scope(self) -> str:
         """One line saying which workloads are eligible, for operator output."""
@@ -308,6 +366,11 @@ def format_for_llm(metrics: list[WorkloadMetrics]) -> str:
             lines.append(
                 "  autoscaler:         "
                 + ("HPA manages the replica count" if m.hpa_managed else "none")
+            )
+        if m.min_window:
+            lines.append(
+                f"  declared min window: {m.min_window}  (sizing decisions need at "
+                f"least this much history; this run observed {m.window})"
             )
         lines.append(f"  {restart_label}")
         if m.last_termination_reason:

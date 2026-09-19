@@ -123,7 +123,12 @@ def load_corpus(policies_dir: Path) -> list[Chunk]:
 def _embedder(model_name: str):
     from sentence_transformers import SentenceTransformer
 
-    return SentenceTransformer(model_name)
+    # Prefer the local cache. Otherwise the library checks the Hugging Face Hub
+    # on every load, which stalls or fails on a slow or offline connection.
+    try:
+        return SentenceTransformer(model_name, local_files_only=True)
+    except Exception:
+        return SentenceTransformer(model_name)
 
 
 def _embed(model_name: str, texts: Iterable[str]) -> list[list[float]]:

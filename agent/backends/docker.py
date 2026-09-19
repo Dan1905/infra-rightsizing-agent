@@ -19,9 +19,11 @@ from .base import (
     MIB,
     ExecutionResult,
     GuardrailError,
+    MIN_WINDOW_LABEL,
     WorkloadMetrics,
     check_cpu,
     check_memory,
+    check_window,
 )
 from .prometheus import instant_query
 
@@ -161,6 +163,7 @@ class DockerBackend:
                     mem_max_bytes=series["mem_max_bytes"].get(name, 0.0),
                     mem_limit_bytes=mem_limit,
                     window=s.lookback,
+                    min_window=labels.get(MIN_WINDOW_LABEL),
                 )
             )
 
@@ -201,6 +204,32 @@ class DockerBackend:
             period = 100_000
             container.update(cpu_period=period, cpu_quota=int(cpu_cores * period))
 
+    def _check(self, action: str, params: dict[str, Any], metrics: WorkloadMetrics | None) -> None:
+        """Guardrails shared by preflight and apply. Raises GuardrailError."""
+        check_window(metrics)
+        if action == "set_memory_limit":
+            check_memory(int(params["memory_mib"]), metrics)
+        elif action == "set_cpu_limit":
+            check_cpu(float(params["cpu_cores"]))
+        elif action == "stop_container" and not self.allow_stop:
+            raise GuardrailError(
+                "stop_container is disabled; re-run with --allow-stop to permit it"
+            )
+
+    def preflight(
+        self,
+        *,
+        target: str,
+        action: str,
+        params: dict[str, Any],
+        metrics: WorkloadMetrics | None,
+    ) -> str | None:
+        try:
+            self._check(action, params, metrics)
+        except GuardrailError as exc:
+            return str(exc)
+        return None
+
     def apply(
         self,
         *,
@@ -216,10 +245,10 @@ class DockerBackend:
                 )
 
             container = self._require_managed(target)
+            self._check(action, params, metrics)
 
             if action == "set_memory_limit":
                 memory_mib = int(params["memory_mib"])
-                check_memory(memory_mib, metrics)
                 before = metrics.mem_limit_bytes / MIB if metrics and metrics.mem_limit_bytes else None
                 container.update(mem_limit=f"{memory_mib}m", memswap_limit=f"{memory_mib}m")
                 shown = f"{before:.0f} MiB -> " if before else ""
@@ -227,16 +256,11 @@ class DockerBackend:
 
             if action == "set_cpu_limit":
                 cpu_cores = float(params["cpu_cores"])
-                check_cpu(cpu_cores)
                 self._set_cpu(container, cpu_cores)
                 before = f"{metrics.cpu_limit_cores:.2f} -> " if metrics and metrics.cpu_limit_cores else ""
                 return ExecutionResult(ok=True, detail=f"CPU limit {before}{cpu_cores:.2f} cores")
 
             if action == "stop_container":
-                if not self.allow_stop:
-                    raise GuardrailError(
-                        "stop_container is disabled; re-run with --allow-stop to permit it"
-                    )
                 container.stop(timeout=30)
                 return ExecutionResult(ok=True, detail="container stopped")
 

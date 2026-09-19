@@ -31,6 +31,21 @@ PRESETS: dict[str, tuple[str | None, str, str]] = {
     "openai": ("https://api.openai.com/v1", "gpt-4o-mini", "OPENAI_API_KEY"),
 }
 
+# Default output budget per provider. Groq's free tier counts max_tokens
+# against an 8K tokens-per-minute cap on each request, so a large reservation
+# leaves no room for the prompt.
+DEFAULT_MAX_TOKENS = {"groq": 3072, "anthropic": 16000, "openai": 4096}
+
+# gpt-oss spends its output budget on reasoning before it writes a tool call.
+# At the default effort that routinely exhausts a free-tier-sized budget and
+# truncates the call mid-argument. The decisions here are structured by the
+# retrieved documents, so low effort is sufficient.
+DEFAULT_REASONING_EFFORT = {"groq": "low"}
+
+
+def max_tokens_for(settings: Settings) -> int:
+    return settings.max_tokens or DEFAULT_MAX_TOKENS.get(settings.provider, 4096)
+
 
 class ProviderError(RuntimeError):
     """Configuration or transport problem talking to the model provider."""
@@ -87,6 +102,31 @@ def to_openai_tools(tool_defs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # --------------------------------------------------------------------------- #
 
 
+def _history_message(message: Any) -> dict[str, Any]:
+    """The assistant turn as it should be sent back on the next request.
+
+    Only content and tool calls are kept. Reasoning models (gpt-oss, and
+    others on OpenAI-compatible endpoints) return their chain of thought in
+    extra fields; echoing that back every turn re-bills it on every later
+    request and, on a small per-request token budget, overflows it within a
+    few turns. The model does not need it.
+    """
+    out: dict[str, Any] = {"role": "assistant", "content": message.content or ""}
+    if message.tool_calls:
+        out["tool_calls"] = [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.function.name,
+                    "arguments": call.function.arguments or "{}",
+                },
+            }
+            for call in message.tool_calls
+        ]
+    return out
+
+
 class OpenAICompatibleProvider:
     """Chat-completions dialect: system as messages[0], tool results as
     separate `role: tool` messages keyed by tool_call_id."""
@@ -126,15 +166,32 @@ class OpenAICompatibleProvider:
     def call(self, messages: list[Any], system: str) -> LLMResponse:
         import openai
 
-        try:
-            completion = self._client.chat.completions.create(
+        kwargs: dict[str, Any] = {}
+        effort = self.settings.reasoning_effort or DEFAULT_REASONING_EFFORT.get(self.name)
+        if effort and "gpt-oss" in self.model:
+            kwargs["reasoning_effort"] = effort
+
+        def create():
+            return self._client.chat.completions.create(
                 model=self.model,
-                max_tokens=self.settings.max_tokens,
+                max_tokens=max_tokens_for(self.settings),
                 temperature=self.settings.temperature,
                 tools=self.tools,
                 tool_choice="auto",
                 messages=messages,
+                **kwargs,
             )
+
+        try:
+            try:
+                completion = create()
+            except openai.BadRequestError as exc:
+                # Groq validates tool-call JSON server-side and rejects a call the
+                # model truncated or malformed ("tool_use_failed"). Sampling is
+                # not deterministic, so one retry usually succeeds.
+                if "tool_use_failed" not in str(exc):
+                    raise
+                completion = create()
         except openai.AuthenticationError as exc:
             _, _, key_env = PRESETS[self.name]
             raise ProviderError(
@@ -146,12 +203,18 @@ class OpenAICompatibleProvider:
                 "Set LLM_MODEL to a model the endpoint serves."
             ) from exc
         except openai.RateLimitError as exc:
-            # Free tiers have tight per-minute token budgets; the SDK has
-            # already retried max_retries times by the time this surfaces.
+            # The SDK has already retried max_retries times by now. Free tiers
+            # cap both tokens per minute and tokens per day; the advice differs.
+            if "per day" in str(exc):
+                advice = (
+                    "The daily token quota is used up; it frees up on a rolling "
+                    "24h window (the message says when). Waiting a minute won't help."
+                )
+            else:
+                advice = "Wait a minute, or try a lower RAG_TOP_K."
             raise ProviderError(
                 f"{self.name} rate limit reached after {self.settings.max_retries} "
-                f"retries ({exc.message}). Try a shorter --lookback, a lower "
-                "RAG_TOP_K, or wait a minute."
+                f"retries ({exc.message}). {advice}"
             ) from exc
         except openai.APIStatusError as exc:
             raise ProviderError(f"{self.name} returned {exc.status_code}: {exc.message}") from exc
@@ -178,7 +241,7 @@ class OpenAICompatibleProvider:
             text=(message.content or "").strip(),
             tool_calls=calls,
             stop_reason=choice.finish_reason or "",
-            assistant_message=message.model_dump(exclude_none=True),
+            assistant_message=_history_message(message),
         )
 
     def tool_result_messages(
@@ -232,7 +295,7 @@ class AnthropicProvider:
         try:
             response = self._client.messages.create(
                 model=self.model,
-                max_tokens=self.settings.max_tokens,
+                max_tokens=max_tokens_for(self.settings),
                 system=system,
                 thinking={"type": "adaptive"},
                 output_config={"effort": self.settings.effort},

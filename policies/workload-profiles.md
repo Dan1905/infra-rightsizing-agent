@@ -31,7 +31,8 @@ where it loads the day's export set and peaks at approximately **1.2 GiB**
 resident for 15-25 minutes.
 
 Any observation window that does not include 02:00-03:00 UTC will show this
-container as almost completely idle. That reading is correct and completely
+container as almost completely idle. It is labelled `cost-opt.min-window: 24h`, so
+automation refuses to resize it on less than a day of history. That reading is correct and completely
 useless for sizing. The 2 GiB limit is deliberate and provides the headroom
 the sizing policy requires over the nightly peak.
 

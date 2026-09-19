@@ -161,7 +161,8 @@ def _run_pipeline(args: argparse.Namespace, interactive: bool) -> int:
     try:
         proposals, narrative, transcript = run_analysis(
             s, metrics=metrics, store=store, audit=audit, run_id=run_id,
-            backend_actions=backend.actions, provider=provider
+            backend_actions=backend.actions, preflight=backend.preflight,
+            provider=provider
         )
     except ProviderError as exc:
         audit.finish_run(run_id, container_count=len(managed), proposal_count=0)

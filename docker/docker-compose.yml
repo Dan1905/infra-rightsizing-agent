@@ -88,4 +88,6 @@ services:
     labels:
       cost-opt.managed: "true"
       cost-opt.tier: "batch"
+      # Its real work happens once a night; sizing it needs a full day of data.
+      cost-opt.min-window: "24h"
     restart: unless-stopped
