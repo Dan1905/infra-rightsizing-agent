@@ -10,6 +10,8 @@ import os
 import random
 import time
 
+CRASH_PROB = float(os.environ.get("CRASH_PROB", "0.05"))
+
 def burn(seconds: float) -> None:
     end = time.monotonic() + seconds
     x = 0.0
@@ -32,6 +34,6 @@ while True:
         time.sleep(1.5)
 
     # Simulate the intermittent crash documented in the March incident.
-    if ticks > 40 and random.random() < 0.05:
+    if ticks > 40 and random.random() < CRASH_PROB:
         print("payment-service: upstream settlement timeout, exiting", flush=True)
         os._exit(1)

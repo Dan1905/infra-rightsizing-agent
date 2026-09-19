@@ -22,6 +22,9 @@ These are not suggestions. Automation must treat them as hard limits.
 - **Never stop or restart this container between 08:00 and 22:00 UTC.**
   Outside that window, changes still require payments-oncall sign-off.
 
+- On Kubernetes, as a tier 1 service, its **requests are not a rightsizing
+  target**; automation must leave them alone.
+
 ## Reading its metrics
 
 Average CPU and memory for this service are misleading by construction. The

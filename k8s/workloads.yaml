@@ -1,0 +1,117 @@
+# The same three load generators as the Docker sandbox, as Deployments.
+#
+# Requests are deliberately inflated relative to real usage (a few MiB and a
+# few percent of a core each) -- that inflation is what the agent is meant to
+# find. Requests, not limits, are what the scheduler packs nodes by, so they
+# are what actually costs money on a Kubernetes cluster.
+#
+# The scripts come from workloads/*.py via the `workload-scripts` ConfigMap,
+# which scripts/k8s-up.sh generates from those files.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-frontend
+  namespace: cost-opt-sandbox
+  labels:
+    app.kubernetes.io/name: web-frontend
+    cost-opt.managed: "true"
+    cost-opt.tier: frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web-frontend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: web-frontend
+        cost-opt.managed: "true"
+        cost-opt.tier: frontend
+    spec:
+      containers:
+        - name: web-frontend
+          image: python:3.12-alpine
+          command: ["python", "-u", "/app/steady.py"]
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+          volumeMounts:
+            - {name: scripts, mountPath: /app, readOnly: true}
+      volumes:
+        - name: scripts
+          configMap: {name: workload-scripts}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  namespace: cost-opt-sandbox
+  labels:
+    app.kubernetes.io/name: payment-service
+    cost-opt.managed: "true"
+    cost-opt.tier: payments
+spec:
+  # The runbook's three-replica floor finally means something here.
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: payment-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: payment-service
+        cost-opt.managed: "true"
+        cost-opt.tier: payments
+    spec:
+      containers:
+        - name: payment-service
+          image: python:3.12-alpine
+          command: ["python", "-u", "/app/spiky.py"]
+          env:
+            # Much lower than the Docker sandbox's default: under Kubernetes a
+            # frequently crashing pod sits in CrashLoopBackOff and drops out of
+            # the available replica count, which drowns every other signal.
+            - {name: CRASH_PROB, value: "0.005"}
+          resources:
+            requests: {cpu: 200m, memory: 256Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          volumeMounts:
+            - {name: scripts, mountPath: /app, readOnly: true}
+      volumes:
+        - name: scripts
+          configMap: {name: workload-scripts}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: batch-worker
+  namespace: cost-opt-sandbox
+  labels:
+    app.kubernetes.io/name: batch-worker
+    cost-opt.managed: "true"
+    cost-opt.tier: batch
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: batch-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: batch-worker
+        cost-opt.managed: "true"
+        cost-opt.tier: batch
+    spec:
+      containers:
+        - name: batch-worker
+          image: python:3.12-alpine
+          command: ["python", "-u", "/app/idle.py"]
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "1", memory: 2Gi}
+          volumeMounts:
+            - {name: scripts, mountPath: /app, readOnly: true}
+      volumes:
+        - name: scripts
+          configMap: {name: workload-scripts}

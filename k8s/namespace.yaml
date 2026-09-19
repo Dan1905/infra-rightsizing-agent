@@ -1,0 +1,8 @@
+# Everything the agent is allowed to touch lives in this namespace. The
+# Kubernetes backend refuses to act anywhere else, whatever the model proposes.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cost-opt-sandbox
+  labels:
+    cost-opt.sandbox: "true"

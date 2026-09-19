@@ -14,7 +14,9 @@ months.
 This service was sized during the 2025 migration by copying the limits from
 the monolith it replaced. Those limits were never revisited and are known to
 be far above what it needs. It is tier 2, stateless, and safe to resize inside
-the headroom rules in the sizing policy.
+the headroom rules in the sizing policy. On Kubernetes its
+requests were copied from the same estimate and are equally oversized; keep
+at least 2 replicas for zero-downtime deploys.
 
 ## payment-service
 
@@ -35,3 +37,8 @@ the sizing policy requires over the nightly peak.
 
 CPU during the nightly run peaks around 0.8 cores; the 1.0 core limit is
 tight but has been adequate.
+
+On Kubernetes its memory request (512 MiB) is deliberately *below* the nightly
+peak, with a 2 GiB limit: the job runs at 02:00 UTC on capacity nobody else is
+using, so it is scheduled Burstable on purpose. Neither raising the request to
+the peak nor lowering it further is wanted.

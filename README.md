@@ -46,7 +46,7 @@ Prometheus + cAdvisor          policies/*.md
 
 `propose_change` never executes anything. It writes a row and returns
 `pending_human_approval`. Execution happens after the loop ends, in
-`agent/actions.py`, and only for proposals a human approved.
+the backend's `apply()` (`agent/backends/`), and only for proposals a human approved.
 
 ## Setup
 
@@ -109,6 +109,36 @@ Useful flags: `--lookback 30m`, `--provider`, `--model`, `--top-k`, and
 `python -m agent.main audit --show-context` to see the passages behind each
 decision.
 
+## Kubernetes backend
+
+The same agent runs against Deployments in a local minikube cluster. Only the
+backend changes; retrieval, reasoning, validation, approval and audit are
+shared.
+
+```bash
+brew install minikube helm
+./scripts/k8s-up.sh                    # cluster, kube-prometheus-stack, workloads
+kubectl port-forward -n monitoring svc/kps-kube-prometheus-stack-prometheus 9091:9090
+python -m agent.main --backend kubernetes metrics
+python -m agent.main --backend kubernetes analyze
+```
+
+What Kubernetes adds:
+
+| | Docker | Kubernetes |
+|---|---|---|
+| Unit of change | container | Deployment (pods are rolled) |
+| Actions | `set_memory_limit`, `set_cpu_limit`, `stop_container` | `set_requests`, `set_limits`, `scale_replicas` |
+| Cost lever | limits | **requests** — the scheduler packs nodes by them |
+| Restart count | since the container was created | `increase()` within the window |
+| Crash reason | — | last termination reason, e.g. `OOMKilled` |
+| Extra guardrails | label | namespace allowlist, server-side dry run before every patch, requests ≤ limits, no manual scaling of HPA-managed Deployments, single-container pods only |
+
+Configuration (requests, limits, replicas, labels, autoscalers) is read from
+the Kubernetes API — the same objects the backend patches. Usage comes from
+Prometheus. Per-pod usage is summarised per Deployment from its busiest replica,
+since requests and limits are set per pod.
+
 ## The sandbox workloads
 
 Three containers, each a different way for "low average utilisation" to be
@@ -126,15 +156,17 @@ A one-hour window makes all three look over-provisioned. Only one of them is.
 
 | Path | What it is |
 |---|---|
-| `agent/metrics.py` | Prometheus queries, joined with Docker's inventory |
+| `agent/backends/base.py` | shared metrics model, guardrail floors, backend contract |
+| `agent/backends/docker.py` | cAdvisor metrics + Docker SDK execution |
+| `agent/backends/kubernetes.py` | Prometheus + Kubernetes API, patches with server-side dry run |
 | `agent/rag.py` | heading-aware markdown chunking, embeddings, Chroma store |
 | `agent/llm.py` | seed retrieval, system prompt, the tool-calling loop |
 | `agent/providers.py` | Groq / Anthropic / OpenAI-compatible backends |
 | `agent/tools.py` | the two tool schemas and their dispatcher + validation |
-| `agent/actions.py` | Docker execution and the guardrails around it |
 | `agent/audit.py` | SQLite: runs, retrievals, decisions, executions |
 | `policies/` | the RAG corpus — replace with your own |
-| `workloads/` | the load generators behind the three sandbox containers |
+| `workloads/` | the load generators behind the three sandbox workloads |
+| `k8s/`, `scripts/k8s-up.sh` | minikube manifests, monitoring values, bring-up script |
 
 ## Safety
 
@@ -142,7 +174,7 @@ A one-hour window makes all three look over-provisioned. Only one of them is.
   observability stack is structurally out of reach.
 - No auto-approve flag exists. `analyze` is the non-interactive mode and it
   cannot execute.
-- Guardrails in `agent/actions.py` run *after* approval and are independent of
+- Guardrails in `agent/backends/` run *after* approval and are independent of
   the model: a hard 128 MiB / 0.25 core floor, and a refusal to set any memory
   limit below 1.2× the observed peak. A retrieved document can make the agent
   more conservative, never less. This matters more, not less, on a small model.
@@ -158,13 +190,6 @@ the classic `image/overlayfs/layerdb` storage layout, which Docker Desktop 29.x
 does not use; with the socket mounted it claims every container and then fails
 to read the read-write layer, emitting no per-container series at all. Without
 it, the raw cgroup factory reports the same containers keyed by cgroup id, and
-`agent/metrics.py` resolves those ids back to names via the Docker API. Series
+`agent/backends/docker.py` resolves those ids back to names via the Docker API. Series
 that do carry a `name` label (a normal Linux host) are used directly, so the
 same code works either way.
-
-## Next
-
-Swapping Docker Compose for minikube changes `agent/metrics.py` (kube-state-metrics
-supplies real restart counts and replica state) and `agent/actions.py` (`kubectl`
-instead of the Docker SDK). The retrieval, reasoning, approval and audit layers
-are unchanged.

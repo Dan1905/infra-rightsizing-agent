@@ -1,0 +1,47 @@
+# kube-prometheus-stack, trimmed to what the agent reads.
+#
+#   Prometheus          -- stores everything, serves the query API
+#   kube-state-metrics  -- requests, limits, replicas, restarts, OOM reasons,
+#                          HPAs, and object labels
+#   kubelet/cAdvisor    -- per-container CPU and memory usage (scraped by
+#                          Prometheus directly, no separate cAdvisor needed)
+#
+# Everything else is off to fit a 4 GiB minikube node.
+
+alertmanager:
+  enabled: false
+grafana:
+  enabled: false
+nodeExporter:
+  enabled: false
+defaultRules:
+  create: false
+
+# Control-plane components are not reachable for scraping on minikube and
+# only produce failing targets.
+kubeEtcd:
+  enabled: false
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+
+prometheus:
+  prometheusSpec:
+    scrapeInterval: 15s
+    retention: 12h
+    resources:
+      requests: {cpu: 200m, memory: 512Mi}
+      limits: {memory: 1Gi}
+    # Pick up ServiceMonitors from any release, not only this one.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+
+kube-state-metrics:
+  # By default kube-state-metrics exports no object labels at all. The agent
+  # needs cost-opt.managed and cost-opt.tier to scope and describe workloads.
+  metricLabelsAllowlist:
+    - deployments=[cost-opt.managed,cost-opt.tier,app.kubernetes.io/name]
+    - pods=[app.kubernetes.io/name]
