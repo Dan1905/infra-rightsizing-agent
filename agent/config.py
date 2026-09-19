@@ -35,9 +35,20 @@ def _env_float(key: str, default: float) -> float:
 
 @dataclass(frozen=True)
 class Settings:
+    # --- Backend ------------------------------------------------------------
+    # docker (default: the compose sandbox) | kubernetes (the minikube sandbox).
+    backend: str = field(default_factory=lambda: _env_str("BACKEND", "docker").lower())
+
     # --- Metrics source -----------------------------------------------------
+    # The two sandboxes run separate Prometheus instances; the Kubernetes one is
+    # reached through `kubectl port-forward` on 9091 (see scripts/k8s-up.sh).
     prometheus_url: str = field(
-        default_factory=lambda: _env_str("PROMETHEUS_URL", "http://localhost:9090")
+        default_factory=lambda: _env_str(
+            "PROMETHEUS_URL",
+            "http://localhost:9091"
+            if os.environ.get("BACKEND", "docker").lower() == "kubernetes"
+            else "http://localhost:9090",
+        )
     )
     # Observation window used for every aggregate. Deliberately configurable:
     # the policy corpus has opinions about windows that are too short.
@@ -51,6 +62,12 @@ class Settings:
     managed_label: str = field(
         default_factory=lambda: _env_str("MANAGED_LABEL", "cost-opt.managed")
     )
+    # Kubernetes only: the single namespace the agent may observe and change,
+    # and the kubeconfig context to use (empty = current context).
+    k8s_namespace: str = field(
+        default_factory=lambda: _env_str("K8S_NAMESPACE", "cost-opt-sandbox")
+    )
+    kube_context: str = field(default_factory=lambda: _env_str("KUBE_CONTEXT", "cost-opt"))
 
     # --- RAG ----------------------------------------------------------------
     policies_dir: Path = field(

@@ -14,15 +14,16 @@ import json
 import sys
 import textwrap
 
-from .actions import Executor
+import os
+
 from .audit import AuditLog
+from .backends import build_backend
+from .backends.base import Backend, MetricsError, format_table
 from .config import Settings, settings as default_settings
 from .llm import run_analysis
 from .providers import ProviderError, build_provider
-from .tools import TOOL_DEFS
-from .metrics import MetricsError, collect, format_table
 from .rag import PolicyStore
-from .tools import Proposal
+from .tools import Proposal, build_tool_defs
 
 RULE = "=" * 78
 
@@ -39,6 +40,14 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
         overrides["model"] = args.model
     if getattr(args, "top_k", None):
         overrides["top_k"] = args.top_k
+    if getattr(args, "backend", None):
+        overrides["backend"] = args.backend.lower()
+        # The Prometheus default follows the backend unless set explicitly.
+        if "prometheus_url" not in overrides and not os.environ.get("PROMETHEUS_URL"):
+            overrides["prometheus_url"] = (
+                "http://localhost:9091" if overrides["backend"] == "kubernetes"
+                else "http://localhost:9090"
+            )
     if not overrides:
         return default_settings
     from dataclasses import replace
@@ -60,20 +69,46 @@ def cmd_index(args: argparse.Namespace) -> int:
     return 0
 
 
+SETUP_HINT = {
+    "docker": "Is the stack up?  docker compose -f docker/docker-compose.yml up -d",
+    "kubernetes": (
+        "Is the cluster up and Prometheus port-forwarded?  ./scripts/k8s-up.sh, then\n"
+        "  kubectl port-forward -n monitoring "
+        "svc/kps-kube-prometheus-stack-prometheus 9091:9090"
+    ),
+}
+
+
+def _connect(s: Settings, *, allow_stop: bool = False) -> tuple[Backend, list] | None:
+    """Build the backend and collect metrics, or print why not."""
+    try:
+        backend = build_backend(s, allow_stop=allow_stop)
+        return backend, backend.collect()
+    except MetricsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+    except Exception as exc:  # docker/kubernetes client setup failures
+        print(f"error: could not connect to the {s.backend} backend: {exc}", file=sys.stderr)
+    print(SETUP_HINT.get(s.backend, ""), file=sys.stderr)
+    return None
+
+
 def cmd_metrics(args: argparse.Namespace) -> int:
     s = _settings_from_args(args)
-    metrics = collect(s)
-    print(f"Observation window: {s.lookback}   source: {s.prometheus_url}\n")
+    connected = _connect(s)
+    if connected is None:
+        return 2
+    backend, metrics = connected
+    print(f"Backend: {backend.name}   window: {s.lookback}   source: {s.prometheus_url}\n")
     print(format_table(metrics))
     managed = [m for m in metrics if m.managed]
-    print(f"\n{len(managed)} of {len(metrics)} containers are in scope "
-          f"(label {s.managed_label}=true)")
+    print(f"\n{len(managed)} of {len(metrics)} workloads are in scope "
+          f"({backend.describe_scope()})")
     return 0
 
 
 def _print_proposal(index: int, proposal: Proposal) -> None:
     print(f"\n{RULE}")
-    print(f"[{index}] {proposal.container}: {proposal.describe().upper()}")
+    print(f"[{index}] {proposal.workload}: {proposal.describe().upper()}")
     print(f"     confidence: {proposal.confidence}", end="")
     if proposal.estimated_saving:
         print(f"   estimated saving: {proposal.estimated_saving}", end="")
@@ -90,20 +125,17 @@ def _run_pipeline(args: argparse.Namespace, interactive: bool) -> int:
     s = _settings_from_args(args)
     audit = AuditLog(s.audit_db)
 
-    try:
-        metrics = collect(s)
-    except MetricsError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        print("Is the stack up?  docker compose -f docker/docker-compose.yml up -d",
-              file=sys.stderr)
+    connected = _connect(s, allow_stop=getattr(args, "allow_stop", False))
+    if connected is None:
         return 2
+    backend, metrics = connected
 
     managed = [m for m in metrics if m.managed]
     if not managed:
-        print(f"No containers carry {s.managed_label}=true; nothing to assess.")
+        print(f"No workloads in scope ({backend.describe_scope()}); nothing to assess.")
         return 0
 
-    print(f"Observation window: {s.lookback}   provider: {s.provider}\n")
+    print(f"Backend: {backend.name}   window: {s.lookback}   provider: {s.provider}\n")
     print(format_table(metrics))
 
     store = PolicyStore(s)
@@ -113,7 +145,7 @@ def _run_pipeline(args: argparse.Namespace, interactive: bool) -> int:
         return 2
 
     try:
-        provider = build_provider(s, TOOL_DEFS)
+        provider = build_provider(s, build_tool_defs(backend.actions))
     except ProviderError as exc:
         print(f"\nerror: {exc}", file=sys.stderr)
         return 2
@@ -122,12 +154,14 @@ def _run_pipeline(args: argparse.Namespace, interactive: bool) -> int:
         model=f"{provider.name}:{provider.model}",
         lookback=s.lookback,
         prometheus_url=s.prometheus_url,
+        backend=backend.name,
     )
     print(f"\nrun: {run_id}\nReasoning over metrics and retrieved policy context ...\n")
 
     try:
         proposals, narrative, transcript = run_analysis(
-            s, metrics=metrics, store=store, audit=audit, run_id=run_id, provider=provider
+            s, metrics=metrics, store=store, audit=audit, run_id=run_id,
+            backend_actions=backend.actions, provider=provider
         )
     except ProviderError as exc:
         audit.finish_run(run_id, container_count=len(managed), proposal_count=0)
@@ -165,7 +199,6 @@ def _run_pipeline(args: argparse.Namespace, interactive: bool) -> int:
         print(f"\n{RULE}\nNo executable changes proposed; nothing to approve.")
         return 0
 
-    executor = Executor(managed_label=s.managed_label, allow_stop=args.allow_stop)
     metrics_by_name = {m.name: m for m in metrics}
 
     print(f"\n{RULE}\nAPPROVAL ({len(executable)} executable changes)")
@@ -174,7 +207,7 @@ def _run_pipeline(args: argparse.Namespace, interactive: bool) -> int:
 
     applied = 0
     for proposal in executable:
-        print(f"\n  {proposal.container}: {proposal.describe()}")
+        print(f"\n  {proposal.workload}: {proposal.describe()}")
         try:
             answer = input("  apply? [yes/no] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -187,11 +220,11 @@ def _run_pipeline(args: argparse.Namespace, interactive: bool) -> int:
             continue
 
         audit.record_decision(proposal.decision_id, "yes")
-        result = executor.apply(
-            container_name=proposal.container,
+        result = backend.apply(
+            target=proposal.workload,
             action=proposal.action,
             params=proposal.params,
-            metrics=metrics_by_name.get(proposal.container),
+            metrics=metrics_by_name.get(proposal.workload),
         )
         audit.record_execution(
             proposal.decision_id,
@@ -268,6 +301,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--prometheus-url", help="override PROMETHEUS_URL")
     parser.add_argument("--lookback", help="observation window, e.g. 30m, 1h, 6h")
+    parser.add_argument("--backend", help="docker | kubernetes")
     parser.add_argument("--provider", help="groq | anthropic | openai")
     parser.add_argument("--model", help="override LLM_MODEL")
     parser.add_argument("--top-k", type=int, help="passages per retrieval")

@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id            TEXT NOT NULL REFERENCES runs(run_id),
     created_at        TEXT NOT NULL,
-    container         TEXT NOT NULL,
+    container         TEXT NOT NULL,     -- workload name (container or Deployment)
     action            TEXT NOT NULL,
     params_json       TEXT NOT NULL,
     reason            TEXT NOT NULL,
@@ -71,6 +71,11 @@ class AuditLog:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as conn:
             conn.executescript(SCHEMA)
+            # Columns added after the first release; CREATE TABLE IF NOT EXISTS
+            # leaves an older database's tables untouched.
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
+            if "backend" not in cols:
+                conn.execute("ALTER TABLE runs ADD COLUMN backend TEXT DEFAULT 'docker'")
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -84,13 +89,15 @@ class AuditLog:
 
     # -- runs ---------------------------------------------------------------
 
-    def start_run(self, *, model: str, lookback: str, prometheus_url: str) -> str:
+    def start_run(
+        self, *, model: str, lookback: str, prometheus_url: str, backend: str = "docker"
+    ) -> str:
         run_id = f"run_{datetime.now(timezone.utc):%Y%m%dT%H%M%S}_{uuid.uuid4().hex[:6]}"
         with self._conn() as conn:
             conn.execute(
-                "INSERT INTO runs (run_id, started_at, model, lookback, prometheus_url)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (run_id, _now(), model, lookback, prometheus_url),
+                "INSERT INTO runs (run_id, started_at, model, lookback, prometheus_url, backend)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (run_id, _now(), model, lookback, prometheus_url, backend),
             )
         return run_id
 
