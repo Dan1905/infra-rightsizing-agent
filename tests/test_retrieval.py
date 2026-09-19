@@ -1,4 +1,4 @@
-from agent.rag import chunk_markdown, dedupe
+from rightsizer.retrieval.store import chunk_markdown, dedupe
 
 from .conftest import chunk
 

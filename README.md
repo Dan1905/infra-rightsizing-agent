@@ -1,208 +1,214 @@
-# Cloud Infra Cost-Optimization Agent
+# Infra Rightsizing Agent
 
-An agent that watches container resource metrics, retrieves the organisation's
-own policies, runbooks and incident postmortems, reasons over both with Claude,
-and proposes remediation that **a human approves before anything executes**.
+An LLM agent that finds over-provisioned containers and Kubernetes workloads,
+grounds every recommendation in your own policies, runbooks and incident
+postmortems, and changes nothing until **a human types `yes`**.
 
-The point is not "flag containers using less than X%". A threshold rule can do
-that, and it is wrong in the ways that matter. This agent is built around three
-properties a rule engine does not have:
+"Flag anything using less than 10% of its limit" is easy to write and wrong in
+the ways that matter. This agent is built around three properties a threshold
+rule doesn't have:
 
-- **It weighs signals against each other.** Peak-to-mean ratio, restart counts,
-  observation-window length and workload type all bear on whether a low average
-  means "over-provisioned" or "you are looking at the wrong hour".
-- **It is grounded in your documents.** Every decision must cite a retrieved
-  passage. If a runbook sets a memory floor, the agent is bound by it and says
-  which document bound it.
-- **It cannot act on its own.** Proposals go into an audit log with the context
-  that produced them, and stop there until someone types `yes`.
+- **It weighs signals against each other.** Peak-to-mean ratio, restarts,
+  observation-window length and workload type decide whether a low average
+  means "over-provisioned" or "you're looking at the wrong hour".
+- **It is grounded in your documents.** Every decision cites a passage it
+  actually retrieved. If a runbook sets a floor, the agent is bound by it and
+  names the document.
+- **It cannot act on its own.** A proposal is a row in an audit log until a
+  person approves that specific change, and hard guardrails run again before
+  anything is applied.
+
+In the bundled sandbox, all three workloads look over-provisioned on a one-hour
+window. The agent resizes one, flags one for review because it is crash-looping
+and its runbook forbids changes, and leaves the third alone because its real
+work happens at 02:00 and the window missed it.
 
 ## How it works
 
 ```
-Prometheus + cAdvisor          policies/*.md
-        │                            │
-        │ CPU/mem/limits             │ chunked by heading
-        │ restarts (Docker API)      │ embedded locally (sentence-transformers)
-        ▼                            ▼
-   metrics summary  ──────►  seed retrieval (chromadb, top-k per container)
-                                     │
-                                     ▼
-              LLM tool-calling loop (Groq / gpt-oss-120b by default)
-                     ├─ search_policies   → pulls more context on demand
-                     └─ propose_change    → one structured decision per container
-                                     │
-                                     ▼
-                        proposals + citations printed
-                                     │
-                              typed yes / no
-                                     │
-                                     ▼
-                      Docker SDK executes, behind guardrails
-                                     │
-                                     ▼
-                       SQLite audit trail (data/audit.db)
+ Prometheus ─── usage over time ───┐          policies/*.md
+ Docker API / Kubernetes API ──────┤                │ chunked by heading,
+   (limits, requests, replicas,    │                │ embedded locally
+    labels, restarts)              ▼                ▼
+                        workload metrics ──► seed retrieval (Chroma)
+                                   │                │
+                                   └───────┬────────┘
+                                           ▼
+                      LLM tool-calling loop (Groq gpt-oss-120b by default)
+                        ├─ search_policies  pull more context on demand
+                        └─ propose_change   one decision per workload,
+                                            validated + guardrail-checked
+                                           │
+                                           ▼
+                            plan with reasoning and citations
+                                           │
+                                     typed yes / no
+                                           │
+                                           ▼
+                      backend applies it, after re-checking guardrails
+                     (Docker SDK, or a Kubernetes patch with a dry run first)
+                                           │
+                                           ▼
+                              SQLite audit trail (data/audit.db)
 ```
 
-`propose_change` never executes anything. It writes a row and returns
-`pending_human_approval`. Execution happens after the loop ends, in
-the backend's `apply()` (`agent/backends/`), and only for proposals a human approved.
+## Quick start (Docker sandbox)
 
-## Setup
+Needs Python 3.11+ (3.13 recommended), Docker, and a free
+[Groq API key](https://console.groq.com/keys).
 
 ```bash
-python3.13 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-export GROQ_API_KEY=gsk_...           # free tier: console.groq.com
+make install                    # .venv + package + test tools
+cp .env.example .env            # then paste your GROQ_API_KEY into it
+make up                         # cAdvisor, Prometheus, three sandbox workloads
+make index                      # embed the policy corpus (first run downloads ~90 MB)
 ```
 
-### Choosing a model provider
-
-The reasoning loop is provider-agnostic (`agent/providers.py`); only the tool-call
-wire format differs between vendors.
-
-| `LLM_PROVIDER` | Endpoint | Default model | Key |
-|---|---|---|---|
-| `groq` *(default)* | `https://api.groq.com/openai/v1` | `openai/gpt-oss-120b` | `GROQ_API_KEY` |
-| `anthropic` | Anthropic Messages API | `claude-opus-5` | `ANTHROPIC_API_KEY` |
-| `openai` | `LLM_BASE_URL` (any OpenAI-compatible: xAI, Together, OpenRouter, local vLLM) | `LLM_MODEL` | `LLM_API_KEY` |
-
-Override per run with `--provider` / `--model`. See `.env.example`.
-
-**On the free tier**, Groq's limits are per-minute token budgets (roughly 8K TPM
-for `openai/gpt-oss-120b`), and this agent sends the metrics plus retrieved
-passages on every turn. If you hit a rate limit, lower `RAG_TOP_K`, shorten
-`--lookback`, or wait a minute — the error message says which knobs to reach for.
-Retrieved passages are pooled and deduplicated across containers for the same
-reason.
-
-**On Groq's free tier** each request (prompt *plus* `max_tokens`) must fit in
-8K tokens, and there is a 200K daily cap. The defaults are tuned for that:
-`max_tokens` 3072, `reasoning_effort=low` for gpt-oss (its reasoning counts
-against the output budget and otherwise truncates tool calls), and the model's
-own reasoning is not echoed back into the conversation on later turns.
-
-**On smaller open-weight models**, expect the loop to lean on its validation more than a
-frontier model does. `propose_change` rejects proposals that target unmanaged
-containers, omit citations, cite documents that were never retrieved, or leave
-required parameters out — each rejection goes back as a tool error for the model
-to correct. That validation is in `agent/tools.py` and runs regardless of which
-provider you point at it.
-
-Bring up the sandbox — cAdvisor, Prometheus, and three deliberately
-over-provisioned workloads with different load shapes:
+Give the workloads 15–20 minutes to build up history, then:
 
 ```bash
-docker compose -f docker/docker-compose.yml up -d
+make metrics                    # what the agent sees
+make analyze                    # propose a plan; never executes
+make run                        # propose, approve each change, execute
+make audit                      # read the trail
 ```
 
-Build the policy index (first run downloads the ~90 MB embedding model):
+`make help` lists every target. The installed command is `rightsize`
+(`.venv/bin/rightsize --help`), with options such as `--lookback 6h`,
+`--provider`, `--model`, `--top-k`, and `rightsize audit --show-context` to see
+the passages behind each decision.
 
-```bash
-python -m agent.main index
-```
-
-Give the workloads 15–20 minutes to accumulate history, then:
-
-```bash
-python -m agent.main metrics    # what Prometheus currently reports
-python -m agent.main analyze    # propose a plan; never prompts, never executes
-python -m agent.main run        # propose → approve → execute
-python -m agent.main audit      # read the trail
-```
-
-Useful flags: `--lookback 30m`, `--provider`, `--model`, `--top-k`, and
-`python -m agent.main audit --show-context` to see the passages behind each
-decision.
-
-## Kubernetes backend
+## Kubernetes
 
 The same agent runs against Deployments in a local minikube cluster. Only the
-backend changes; retrieval, reasoning, validation, approval and audit are
+backend changes; retrieval, reasoning, validation, approval and auditing are
 shared.
 
 ```bash
 brew install minikube helm
-./scripts/k8s-up.sh                    # cluster, kube-prometheus-stack, workloads
-kubectl port-forward -n monitoring svc/kps-kube-prometheus-stack-prometheus 9091:9090
-python -m agent.main --backend kubernetes metrics
-python -m agent.main --backend kubernetes analyze
+make k8s-up                     # cluster, kube-prometheus-stack, workloads
+make port-forward               # in its own terminal; Prometheus on :9091
+make analyze BACKEND=kubernetes
 ```
 
-What Kubernetes adds:
+Or set `BACKEND=kubernetes` in `.env`.
 
 | | Docker | Kubernetes |
 |---|---|---|
 | Unit of change | container | Deployment (pods are rolled) |
 | Actions | `set_memory_limit`, `set_cpu_limit`, `stop_container` | `set_requests`, `set_limits`, `scale_replicas` |
-| Cost lever | limits | **requests** — the scheduler packs nodes by them |
-| Restart count | since the container was created | `increase()` within the window |
+| Cost lever | limits | **requests**, since the scheduler packs nodes by them |
+| Restart count | since the container was created | within the observation window |
 | Crash reason | — | last termination reason, e.g. `OOMKilled` |
-| Extra guardrails | label | namespace allowlist, server-side dry run before every patch, requests ≤ limits, no manual scaling of HPA-managed Deployments, single-container pods only |
+| Extra guardrails | — | namespace scope, server-side dry run before every patch, requests ≤ limits, no manual scaling of HPA-managed Deployments, single-container pods only |
 
-Configuration (requests, limits, replicas, labels, autoscalers) is read from
-the Kubernetes API — the same objects the backend patches. Usage comes from
-Prometheus. Per-pod usage is summarised per Deployment from its busiest replica,
-since requests and limits are set per pod.
+Configuration (requests, limits, replicas, labels, autoscalers) comes from the
+Kubernetes API, which holds the same objects the backend patches. Usage comes
+from Prometheus. Per-pod usage is summarised per Deployment from its busiest
+replica, since requests and limits are set per pod.
 
-## The sandbox workloads
+## Configuration
 
-Three containers, each a different way for "low average utilisation" to be
-misleading:
+Everything is set in `.env`; see `.env.example` for the full list.
 
-| Container | Shape | Limits | What the corpus says |
+**Model provider.** The loop is provider-agnostic; only the tool-call wire
+format differs.
+
+| `LLM_PROVIDER` | Endpoint | Default model | Key |
 |---|---|---|---|
-| `web-frontend` | steady ~8% of a core, flat ~30 MiB | 1.5 cores / 1 GiB | genuinely oversized, tier 2, safe to resize |
-| `payment-service` | idle then hard bursts, intermittent crash | 2 cores / 1 GiB | tier 1, hard 768 MiB floor, restarts are a gateway fault |
-| `batch-worker` | near-idle all day | 1 core / 2 GiB | real job runs at 02:00 UTC and peaks at ~1.2 GiB |
+| `groq` *(default)* | `https://api.groq.com/openai/v1` | `openai/gpt-oss-120b` | `GROQ_API_KEY` |
+| `anthropic` | Anthropic Messages API | `claude-opus-5` | `ANTHROPIC_API_KEY` |
+| `openai` | `LLM_BASE_URL`: any OpenAI-compatible API (xAI, Together, OpenRouter, vLLM) | `LLM_MODEL` | `LLM_API_KEY` |
 
-A one-hour window makes all three look over-provisioned. Only one of them is.
+**Groq's free tier** allows 8K tokens per request (prompt *plus* `max_tokens`)
+and 200K per day. The defaults are tuned to fit: `max_tokens` 3072,
+`reasoning_effort=low` for gpt-oss (its reasoning counts against the output
+budget and otherwise truncates tool calls), the model's reasoning is not sent
+back on later turns, and retrieved passages are deduplicated across workloads.
+If you hit a limit, the error says whether it was the per-minute or the daily
+quota.
 
-## Layout
+## Safety model
 
-| Path | What it is |
-|---|---|
-| `agent/backends/base.py` | shared metrics model, guardrail floors, backend contract |
-| `agent/backends/docker.py` | cAdvisor metrics + Docker SDK execution |
-| `agent/backends/kubernetes.py` | Prometheus + Kubernetes API, patches with server-side dry run |
-| `agent/rag.py` | heading-aware markdown chunking, embeddings, Chroma store |
-| `agent/llm.py` | seed retrieval, system prompt, the tool-calling loop |
-| `agent/providers.py` | Groq / Anthropic / OpenAI-compatible backends |
-| `agent/tools.py` | the two tool schemas and their dispatcher + validation |
-| `agent/audit.py` | SQLite: runs, retrievals, decisions, executions |
-| `policies/` | the RAG corpus — replace with your own |
-| `workloads/` | the load generators behind the three sandbox workloads |
-| `k8s/`, `scripts/k8s-up.sh` | minikube manifests, monitoring values, bring-up script |
+- **Scope is structural.** Only workloads labelled `cost-opt.managed=true` (and,
+  on Kubernetes, only in the `cost-opt-sandbox` namespace) can be changed. The
+  monitoring stack is out of reach.
+- **Nothing executes without typed approval**, one change at a time. There is
+  no auto-approve flag. `analyze` is the non-interactive mode, and it cannot
+  execute.
+- **Guardrails don't depend on the model.** They are in
+  `src/rightsizer/backends/guardrails.py` and include hard memory and CPU
+  floors and a refusal to go below 1.2× the observed peak. A retrieved document
+  can make the agent more conservative, never less.
+- **Guardrails run twice.** At proposal time (preflight, against the observed
+  state) a blocked change goes back to the model to correct before any human
+  sees it. At execution they run again against live state.
+- **Workloads can declare the history they need.** A label such as
+  `cost-opt.min-window: 24h` makes any change on a shorter window impossible,
+  whatever the model concluded. This is the lesson of the sandbox's March
+  postmortem, moved from a document into enforcement.
+- **Everything is recorded:** the retrievals, the proposal and its citations,
+  the human decision, and the execution result.
 
-## Safety
+## Project layout
 
-- Only containers labelled `cost-opt.managed=true` can be modified. The
-  observability stack is structurally out of reach.
-- No auto-approve flag exists. `analyze` is the non-interactive mode and it
-  cannot execute.
-- Guardrails in `agent/backends/` run *after* approval and are independent of
-  the model: a hard 128 MiB / 0.25 core floor, and a refusal to set any memory
-  limit below 1.2× the observed peak. A retrieved document can make the agent
-  more conservative, never less. This matters more, not less, on a small model.
-- Guardrails run twice: once when the model proposes (a "preflight" against the
-  observed state, so a blocked proposal goes back to the model to correct
-  before any human sees it) and again at execution against live state.
-- A workload can declare how much history a sizing decision needs with the
-  label `cost-opt.min-window` (e.g. `24h` for a nightly job). Any change on a
-  shorter observation window is refused, whatever the model concluded. This is
-  the March postmortem's lesson moved from a document into enforcement.
-- `stop_container` requires `--allow-stop` on top of the typed approval.
-- Every run stores its retrievals, proposals, citations, the human decision and
-  the execution result.
+```
+src/rightsizer/
+├── cli.py                 `rightsize` command: argument parsing only
+├── pipeline.py            one run: collect → reason → approve → execute → audit
+├── config.py              settings from the environment / .env
+├── audit.py               SQLite audit trail
+├── reporting.py           metrics table for people, labelled blocks for the model
+├── agent/
+│   ├── loop.py            the tool-calling loop and seed retrieval
+│   ├── prompts.py         system prompt, retrieval queries, user message
+│   ├── tools.py           tool schemas and per-backend action specs
+│   └── proposals.py       Proposal, validation, what each tool call does
+├── llm/providers.py       Groq / Anthropic / OpenAI-compatible
+├── retrieval/store.py     markdown chunking, local embeddings, Chroma
+└── backends/
+    ├── base.py            WorkloadMetrics and the Backend contract
+    ├── guardrails.py      every hard safety check
+    ├── prometheus.py      query client
+    ├── docker.py          cAdvisor metrics + Docker SDK
+    └── kubernetes.py      Kubernetes API + Prometheus, dry-run patches
+policies/                  the retrieval corpus: replace with your own
+sandbox/
+├── workloads/             the three load generators
+├── docker/                compose stack: cAdvisor, Prometheus, workloads
+└── kubernetes/            manifests, monitoring values, up.sh
+tests/                     unit tests; no Docker, cluster, network or model needed
+```
 
-## Notes on the cAdvisor setup
+## Development
 
-`docker-compose.yml` deliberately does not mount `/var/run/docker.sock` into
-cAdvisor and does not pass `--docker_only`. cAdvisor's Docker handler expects
-the classic `image/overlayfs/layerdb` storage layout, which Docker Desktop 29.x
-does not use; with the socket mounted it claims every container and then fails
-to read the read-write layer, emitting no per-container series at all. Without
-it, the raw cgroup factory reports the same containers keyed by cgroup id, and
-`agent/backends/docker.py` resolves those ids back to names via the Docker API. Series
-that do carry a `name` label (a normal Linux host) are used directly, so the
-same code works either way.
+```bash
+make test
+```
+
+The suite covers the guardrails, both backends against fake API clients,
+proposal validation, the reasoning loop driven by a scripted model, chunking,
+the provider helpers and report rendering.
+
+## The sandbox
+
+Three workloads, each a different way for a low average to mislead:
+
+| Workload | Load shape | What the policy corpus says |
+|---|---|---|
+| `web-frontend` | steady ~8% of a core, tiny flat memory | genuinely oversized, tier 2, safe to resize |
+| `payment-service` | idle, then hard bursts; crashes intermittently | tier 1, hard 768 MiB floor, restarts are a gateway fault |
+| `batch-worker` | near-idle all day | real job runs at 02:00 UTC and peaks at ~1.2 GiB; needs 24h of history |
+
+The workloads and the policy documents are synthetic, written so that metrics
+and documentation disagree in realistic ways. The infrastructure, metrics
+pipeline, agent and execution paths are real.
+
+**cAdvisor on Docker Desktop.** The compose file deliberately doesn't mount
+`/var/run/docker.sock` into cAdvisor or pass `--docker_only`. cAdvisor's Docker
+handler expects a storage layout that Docker Desktop 29.x doesn't use, so with
+the socket mounted it emits no per-container series at all. Without it, the raw
+cgroup factory reports the same containers by cgroup id, and
+`backends/docker.py` maps those ids back to names through the Docker API. On a
+normal Linux host the series carry names directly, and the same code handles
+both.

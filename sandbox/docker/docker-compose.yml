@@ -27,7 +27,7 @@ services:
     # not use -- with the socket mounted it claims every container and then
     # fails to read the read-write layer, emitting nothing. Without it, the raw
     # cgroup factory reports the same containers keyed by cgroup id, which
-    # agent/backends/docker.py resolves back to container names via the Docker API.
+    # src/rightsizer/backends/docker.py resolves back to container names via the Docker API.
     command:
       - --housekeeping_interval=5s
     restart: unless-stopped

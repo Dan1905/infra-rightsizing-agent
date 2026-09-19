@@ -7,10 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from agent.audit import AuditLog
-from agent.backends.base import MIB, WorkloadMetrics
-from agent.config import Settings
-from agent.rag import Chunk
+from rightsizer.audit import AuditLog
+from rightsizer.backends.base import MIB, WorkloadMetrics
+from rightsizer.config import Settings
+from rightsizer.retrieval.store import Chunk
 
 
 def make_metrics(name: str = "web-frontend", **overrides) -> WorkloadMetrics:

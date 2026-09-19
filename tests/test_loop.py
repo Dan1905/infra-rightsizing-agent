@@ -1,8 +1,8 @@
 """The reasoning loop driven by a scripted provider -- no model involved."""
 
-from agent.config import Settings
-from agent.llm import run_analysis
-from agent.providers import LLMResponse, ToolCall
+from rightsizer.config import Settings
+from rightsizer.agent.loop import run_analysis
+from rightsizer.llm.providers import LLMResponse, ToolCall
 
 CITE = ["workload-profiles.md > web-frontend"]
 

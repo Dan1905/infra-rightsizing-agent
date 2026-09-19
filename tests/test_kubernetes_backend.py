@@ -4,8 +4,8 @@ import pytest
 from kubernetes import client as k8s
 from kubernetes.client.rest import ApiException
 
-from agent.backends.base import MIB
-from agent.backends.kubernetes import KubernetesBackend
+from rightsizer.backends.base import MIB
+from rightsizer.backends.kubernetes import KubernetesBackend
 
 from .conftest import make_metrics
 

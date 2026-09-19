@@ -1,8 +1,8 @@
 from types import SimpleNamespace
 
-from agent.providers import _history_message, max_tokens_for, to_openai_tools
-from agent.config import Settings
-from agent.tools import build_tool_defs
+from rightsizer.llm.providers import _history_message, max_tokens_for, to_openai_tools
+from rightsizer.config import Settings
+from rightsizer.agent.tools import build_tool_defs
 
 
 def test_tool_schemas_translate_to_openai_shape():

@@ -8,7 +8,8 @@ PROFILE="${MINIKUBE_PROFILE:-cost-opt}"
 HELM_TIMEOUT="${HELM_TIMEOUT:-10m}"
 NS="cost-opt-sandbox"
 MON_NS="monitoring"
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+HERE="$(cd "$(dirname "$0")" && pwd)"          # sandbox/kubernetes
+WORKLOADS="$(cd "$HERE/../workloads" && pwd)"  # sandbox/workloads
 
 if ! minikube status -p "$PROFILE" >/dev/null 2>&1; then
   echo "==> starting minikube ($PROFILE)"
@@ -20,7 +21,7 @@ echo "==> monitoring (kube-prometheus-stack)"
 helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null 2>&1 || true
 helm upgrade --install kps prometheus-community/kube-prometheus-stack \
   --namespace "$MON_NS" --create-namespace \
-  -f "$ROOT/k8s/monitoring-values.yaml" --wait --timeout "$HELM_TIMEOUT"
+  -f "$HERE/monitoring-values.yaml" --wait --timeout "$HELM_TIMEOUT"
 
 echo "==> sandbox workloads"
 # minikube has its own image store. If the host already has the workload image,
@@ -28,12 +29,12 @@ echo "==> sandbox workloads"
 if docker image inspect python:3.12-alpine >/dev/null 2>&1; then
   minikube -p "$PROFILE" image load python:3.12-alpine
 fi
-kubectl apply -f "$ROOT/k8s/namespace.yaml"
-# Generated from workloads/*.py so the Docker and Kubernetes sandboxes run
+kubectl apply -f "$HERE/namespace.yaml"
+# Generated from sandbox/workloads/*.py so the Docker and Kubernetes sandboxes run
 # identical scripts.
 kubectl create configmap workload-scripts -n "$NS" \
-  --from-file="$ROOT/workloads/" --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -f "$ROOT/k8s/workloads.yaml"
+  --from-file="$WORKLOADS/" --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f "$HERE/workloads.yaml"
 kubectl rollout status -n "$NS" deploy --timeout=5m
 
 cat <<MSG

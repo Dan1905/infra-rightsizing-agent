@@ -6,10 +6,12 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+# src/rightsizer/config.py -> repository root. Paths default to the checkout
+# (policies/, data/, .env); every one can be overridden from the environment.
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Load .env before any field default reads the environment. Real environment
-# variables win over the file, so `GROQ_API_KEY=... python -m agent.main` still
+# variables win over the file, so `GROQ_API_KEY=... rightsize analyze` still
 # overrides whatever .env holds.
 try:
     from dotenv import load_dotenv
@@ -41,7 +43,7 @@ class Settings:
 
     # --- Metrics source -----------------------------------------------------
     # The two sandboxes run separate Prometheus instances; the Kubernetes one is
-    # reached through `kubectl port-forward` on 9091 (see scripts/k8s-up.sh).
+    # reached through `kubectl port-forward` on 9091 (see `make port-forward`).
     prometheus_url: str = field(
         default_factory=lambda: _env_str(
             "PROMETHEUS_URL",

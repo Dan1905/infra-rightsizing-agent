@@ -2,8 +2,8 @@
 
 import pytest
 
-from agent.backends.base import MIB
-from agent.backends.docker import DockerBackend, _resolve_name
+from rightsizer.backends.base import MIB
+from rightsizer.backends.docker import DockerBackend, _resolve_name, configured_limits
 
 from .conftest import make_metrics
 
@@ -48,3 +48,16 @@ def test_resolve_name_prefers_label_then_cgroup_id():
     assert _resolve_name({"name": "direct"}, ids) == "direct"
     assert _resolve_name({"id": f"/docker/{cid}"}, ids) == "web-frontend"
     assert _resolve_name({"id": "/system.slice"}, ids) is None
+
+
+@pytest.mark.parametrize(
+    "host_config, expected",
+    [
+        ({"Memory": 1073741824, "NanoCpus": 2_000_000_000}, (2.0, 1073741824.0)),  # --cpus
+        ({"Memory": 0, "CpuQuota": 150_000, "CpuPeriod": 100_000}, (1.5, None)),   # quota
+        ({"CpuQuota": 50_000, "CpuPeriod": 0}, (0.5, None)),       # default period
+        ({}, (None, None)),                                           # unlimited
+    ],
+)
+def test_limits_come_from_host_config(host_config, expected):
+    assert configured_limits(host_config) == expected

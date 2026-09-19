@@ -1,7 +1,7 @@
 import pytest
 
-from agent.backends.base import (
-    MIB,
+from rightsizer.backends.base import MIB
+from rightsizer.backends.guardrails import (
     GuardrailError,
     check_cpu,
     check_cpu_request,

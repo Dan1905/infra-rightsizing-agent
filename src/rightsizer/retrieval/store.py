@@ -15,7 +15,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
-from .config import Settings
+from ..config import Settings
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 MAX_CHUNK_CHARS = 1400
@@ -177,7 +177,7 @@ class PolicyStore:
         k = k or self.settings.top_k
         if self.count() == 0:
             raise RuntimeError(
-                "Policy index is empty. Run `python -m agent.main index` first."
+                "Policy index is empty. Run `rightsize index` first."
             )
         result = self._collection.query(
             query_embeddings=_embed(self.settings.embedding_model, [query]),

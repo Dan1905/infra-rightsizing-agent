@@ -16,7 +16,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from .config import Settings
+from ..config import Settings
 
 # provider -> (base_url, default model, env var holding the key)
 PRESETS: dict[str, tuple[str | None, str, str]] = {

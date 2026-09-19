@@ -22,12 +22,11 @@ from kubernetes.client.rest import ApiException
 from kubernetes.utils import parse_quantity
 
 from ..config import Settings
-from .base import (
+from .base import ExecutionResult, WorkloadMetrics
+from .guardrails import (
+    GuardrailError,
     MIN_REPLICAS,
     MIN_WINDOW_LABEL,
-    ExecutionResult,
-    GuardrailError,
-    WorkloadMetrics,
     check_cpu,
     check_cpu_request,
     check_memory,

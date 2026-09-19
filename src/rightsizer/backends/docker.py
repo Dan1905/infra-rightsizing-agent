@@ -1,8 +1,9 @@
 """Docker backend: cAdvisor metrics via Prometheus, changes via the Docker SDK.
 
-Prometheus supplies the utilisation time series; the Docker API supplies the
-things cAdvisor does not expose at container granularity -- restart counts,
-labels, and lifecycle state. The two are joined on the container name.
+As on Kubernetes, configuration comes from the API that owns it and usage from
+the time series. The Docker API supplies limits, restart counts, labels and
+lifecycle state; Prometheus supplies CPU and memory usage over the window. The
+two are joined on the container name.
 """
 
 from __future__ import annotations
@@ -15,12 +16,10 @@ import docker
 from docker.errors import APIError, NotFound
 
 from ..config import Settings
-from .base import (
-    MIB,
-    ExecutionResult,
+from .base import ExecutionResult, MIB, WorkloadMetrics
+from .guardrails import (
     GuardrailError,
     MIN_WINDOW_LABEL,
-    WorkloadMetrics,
     check_cpu,
     check_memory,
     check_window,
@@ -58,10 +57,27 @@ def _queries(lookback: str, step: str) -> dict[str, str]:
         "mem_avg_bytes": f"avg_over_time({mem}[{lookback}])",
         "mem_p95_bytes": f"quantile_over_time(0.95, {mem}[{lookback}])",
         "mem_max_bytes": f"max_over_time({mem}[{lookback}])",
-        "mem_limit_bytes": "container_spec_memory_limit_bytes",
-        "cpu_quota": "container_spec_cpu_quota",
-        "cpu_period": "container_spec_cpu_period",
     }
+
+
+def configured_limits(host_config: dict) -> tuple[float | None, float | None]:
+    """(cpu cores, memory bytes) from a container's HostConfig; None = unlimited.
+
+    Read from Docker rather than cAdvisor's container_spec_* series: those
+    disappear while a container is restarting, so a crash-looping container
+    would intermittently look unlimited.
+    """
+    memory = host_config.get("Memory") or 0
+    nano = host_config.get("NanoCpus") or 0
+    quota = host_config.get("CpuQuota") or 0
+    period = host_config.get("CpuPeriod") or 100_000  # the kernel default
+    if nano > 0:
+        cpu = nano / 1_000_000_000
+    elif quota > 0:
+        cpu = quota / period
+    else:
+        cpu = None
+    return cpu, (float(memory) if memory > 0 else None)
 
 
 def _parse_started_at(raw: str | None) -> float:
@@ -131,15 +147,7 @@ class DockerBackend:
             if container.status != "running" and not is_managed:
                 continue
             attrs = container.attrs or {}
-
-            quota = series["cpu_quota"].get(name, -1.0)
-            period = series["cpu_period"].get(name, 0.0)
-            cpu_limit = quota / period if quota > 0 and period > 0 else None
-
-            mem_limit = series["mem_limit_bytes"].get(name)
-            # cAdvisor reports 0 for "unlimited".
-            if not mem_limit or mem_limit <= 0:
-                mem_limit = None
+            cpu_limit, mem_limit = configured_limits(attrs.get("HostConfig") or {})
 
             results.append(
                 WorkloadMetrics(

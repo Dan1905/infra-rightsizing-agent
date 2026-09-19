@@ -1,4 +1,5 @@
-from agent.backends.base import MIB, format_for_llm, format_table
+from rightsizer.backends.base import MIB
+from rightsizer.reporting import format_for_llm, format_table
 
 from .conftest import make_metrics
 

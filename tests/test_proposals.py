@@ -4,7 +4,8 @@ import json
 
 import pytest
 
-from agent.tools import ToolContext, build_tool_defs
+from rightsizer.agent.proposals import ToolContext
+from rightsizer.agent.tools import build_tool_defs
 
 K8S = ("set_requests", "set_limits", "scale_replicas")
 DOCKER = ("set_memory_limit", "set_cpu_limit", "stop_container")

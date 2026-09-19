@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "infra-rightsizing-agent"
+version = "0.2.0"
+description = "An LLM agent that rightsizes containers and Kubernetes workloads, grounded in your own policies and runbooks, with human approval before anything changes."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # Model providers -- Groq and other OpenAI-compatible endpoints, or Anthropic.
+    "openai>=1.40",
+    "anthropic>=1.0",
+    # Metrics and execution backends.
+    "requests>=2.31",
+    "docker>=7.1",
+    "kubernetes>=30.0",
+    # Retrieval.
+    "chromadb>=0.5",
+    "sentence-transformers>=3.0",
+    # Config.
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+rightsize = "rightsizer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Lets the suite run from a plain checkout, without installing the package.
+pythonpath = ["src"]

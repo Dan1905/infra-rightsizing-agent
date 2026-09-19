@@ -5,8 +5,8 @@
 # find. Requests, not limits, are what the scheduler packs nodes by, so they
 # are what actually costs money on a Kubernetes cluster.
 #
-# The scripts come from workloads/*.py via the `workload-scripts` ConfigMap,
-# which scripts/k8s-up.sh generates from those files.
+# The scripts come from sandbox/workloads/*.py via the `workload-scripts`
+# ConfigMap, which up.sh generates from those files.
 
 apiVersion: apps/v1
 kind: Deployment
